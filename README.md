@@ -1,6 +1,9 @@
 ![Version](https://img.shields.io/badge/version-v1.0-blue)
 ![License](https://img.shields.io/badge/license-BSL_1.1-orange)
 ![Layer](https://img.shields.io/badge/layer-Language-lightgrey)
+
+AIO is the token economy engine of the Technosis ecosystem — governing value flows, agent compensation, and sovereign economic protocols.
+
 # AIO Phase‑1 (Secure Minimal)
 
 **What’s here**
