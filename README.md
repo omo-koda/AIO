@@ -1,3 +1,6 @@
+![Version](https://img.shields.io/badge/version-v1.0-blue)
+![License](https://img.shields.io/badge/license-BSL_1.1-orange)
+![Layer](https://img.shields.io/badge/layer-Language-lightgrey)
 # AIO Phase‑1 (Secure Minimal)
 
 **What’s here**
@@ -37,3 +40,16 @@ PKG=0x... CFG_ID=0x... ROOT_HEX=<32Bhex> COUNT=123 EPOCH=1 ./scripts/submit_root
 PKG=0x... MIN_BOND=1000000000 PUBKEY_HEX=<hex> ./scripts/register_oracle.sh
 
 > **Note** Phase‑1 uses off‑chain quorum discipline. Phase‑2 should add on‑chain multisig & slashing.
+
+## The Aṣẹ Token Economy
+
+AIO (Aṣẹ Input/Output) defines the core tokenomics, smart contracts, and economic principles for the Technosis ecosystem. It includes the Move contracts for minting, burning, and distributing Àṣẹ and other soul-bound tokens.
+
+
+---
+
+## Part of the Technosis Sovereign Ecosystem
+
+This component is a core piece of a larger architecture for creating and coordinating sovereign AI. For more information, see the [organism-core repository](https://github.com/Bino-Elgua/organism-core).
+
+Àṣẹ.
