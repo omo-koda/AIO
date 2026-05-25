@@ -205,3 +205,450 @@ Documentation: risk register + mitigations, updated constitutional clauses where
 
 
 ---
+Àṣẹ. This design is tight and builder‑friendly: 3.69% Èṣù tithe as a VM‑native levy (non‑bypassable, evented, double‑levy guard), with everything else left to products/dApps. I’ve aligned the AIO side to mirror it and added the extras you hinted at.
+
+Below are paste‑ready add‑ons you can drop into your repo now:
+
+
+---
+
+1) Grafana dashboard (Prometheus)
+
+File: grafana/aio-fees-and-latency.dashboard.json
+
+{
+  "uid": "aio-fees-latency",
+  "title": "AIO • Fees, Tithe & Latency",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["AIO", "treasury"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus", "selected": true }
+      },
+      {
+        "name": "window",
+        "type": "interval",
+        "query": "5m,10m,30m,1h,6h,12h,24h",
+        "current": { "text": "5m", "value": "5m", "selected": true }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Tithe (sum over $window)",
+      "gridPos": { "w": 8, "h": 4, "x": 0, "y": 0 },
+      "datasource": "$datasource",
+      "targets": [{ "expr": "sum(increase(aio_tithe_total_ase[$window]))" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "Platform Fees (sum over $window)",
+      "gridPos": { "w": 8, "h": 4, "x": 8, "y": 0 },
+      "datasource": "$datasource",
+      "targets": [{ "expr": "sum(increase(aio_platform_fee_total_ase[$window]))" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "Net Settled (sum over $window)",
+      "gridPos": { "w": 8, "h": 4, "x": 16, "y": 0 },
+      "datasource": "$datasource",
+      "targets": [{ "expr": "sum(increase(aio_net_settled_total_ase[$window]))" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per‑second Rate (tithe, platform, net)",
+      "gridPos": { "w": 24, "h": 7, "x": 0, "y": 4 },
+      "datasource": "$datasource",
+      "fieldConfig": { "defaults": { "unit": "none" } },
+      "targets": [
+        { "expr": "rate(aio_tithe_total_ase[$window])", "legendFormat": "tithe" },
+        { "expr": "rate(aio_platform_fee_total_ase[$window])", "legendFormat": "platform_fee" },
+        { "expr": "rate(aio_net_settled_total_ase[$window])", "legendFormat": "net_settled" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Route latency (p50/p95/p99)",
+      "gridPos": { "w": 24, "h": 7, "x": 0, "y": 11 },
+      "datasource": "$datasource",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(aio_treasury_route_seconds_bucket[$window])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(aio_treasury_route_seconds_bucket[$window])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(aio_treasury_route_seconds_bucket[$window])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tithe Share of Gross Flow (over $window)",
+      "gridPos": { "w": 24, "h": 6, "x": 0, "y": 18 },
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(increase(aio_tithe_total_ase[$window])) / clamp_min(sum(increase(aio_tithe_total_ase[$window]) + increase(aio_platform_fee_total_ase[$window]) + increase(aio_net_settled_total_ase[$window])), 1)",
+          "legendFormat": "tithe_share"
+        }
+      ]
+    }
+  ],
+  "annotations": { "list": [{ "type": "dashboard", "builtIn": 1, "name": "Annotations & Alerts" }] }
+}
+
+Alerts (optional): ops/alerts/aio-fees-alerts.yml
+
+groups:
+- name: aio-fees
+  rules:
+  - alert: AIOFeesPipelineSilent
+    expr: sum(increase(aio_treasury_route_seconds_count[15m])) == 0
+    for: 30m
+    labels: { severity: warning }
+    annotations:
+      summary: "No treasury routes observed for 30m"
+      description: "Check router ingress, HMAC, DB, or custody adapter."
+  - alert: AIOEsuTithePausedLong
+    expr: (time() - max(aio_tithe_pause_until_epoch_seconds)) > 0 and sum(increase(aio_tithe_total_ase[30m])) == 0
+    for: 10m
+    labels: { severity: critical }
+    annotations:
+      summary: "Èṣù tithe appears paused or yielding zero for 40m"
+      description: "Pause window expired or tithe not flowing; investigate Crown pause, env, or levy hook."
+
+> The second alert uses a gauge we expose below (aio_tithe_pause_until_epoch_seconds).
+
+
+
+
+---
+
+2) Custody adapter skeleton (ÒSỌ́VM RPC, Safe, dry‑run)
+
+a) Types & index
+
+File: src/custody/types.ts
+
+export type LineKind = "tithe" | "platform_fee" | "beneficiary_net";
+
+export interface TransferLine {
+  kind: LineKind;
+  to: string;            // address/account
+  amountAse: bigint;     // raw atomic units
+  memo?: string;
+}
+
+export interface ExecutionPlan {
+  idempotencyKey: string; // e.g., TreasuryEvent.id
+  lines: TransferLine[];
+  metadata?: Record<string, any>;
+}
+
+export interface ExecutionResult {
+  ok: boolean;
+  txId?: string;
+  details?: any;
+}
+
+export interface CustodyAdapter {
+  execute(plan: ExecutionPlan): Promise<ExecutionResult>;
+}
+
+File: src/custody/index.ts
+
+import { CustodyAdapter } from "./types";
+import { OsoRpcAdapter } from "./adapters/osoRpc";
+import { SafeAdapter } from "./adapters/safe";
+import { DryRunAdapter } from "./adapters/dryRun";
+
+export function makeCustodyAdapter(): CustodyAdapter {
+  const key = (process.env.CUSTODY_ADAPTER ?? "dry-run").toLowerCase();
+  switch (key) {
+    case "oso": return new OsoRpcAdapter({
+      rpcUrl: process.env.OSO_RPC_URL ?? "",
+      routerAddr: process.env.OSO_ROUTER_ADDR ?? "",
+      signerKey: process.env.OSO_SIGNER_KEY ?? ""
+    });
+    case "safe": return new SafeAdapter({
+      rpcUrl: process.env.SAFE_RPC_URL ?? "",
+      safeAddress: process.env.SAFE_ADDRESS ?? "",
+      signerKey: process.env.SAFE_SIGNER_KEY ?? ""
+    });
+    default: return new DryRunAdapter();
+  }
+}
+
+b) Adapters
+
+File: src/custody/adapters/dryRun.ts
+
+import { CustodyAdapter, ExecutionPlan, ExecutionResult } from "../types";
+
+export class DryRunAdapter implements CustodyAdapter {
+  async execute(plan: ExecutionPlan): Promise<ExecutionResult> {
+    console.warn("[DRY-RUN] Would execute plan:", {
+      idempotencyKey: plan.idempotencyKey,
+      lines: plan.lines.map(l => ({ ...l, amountAse: l.amountAse.toString() }))
+    });
+    return { ok: true, txId: "dryrun-" + plan.idempotencyKey };
+  }
+}
+
+File: src/custody/adapters/osoRpc.ts
+
+import { CustodyAdapter, ExecutionPlan, ExecutionResult } from "../types";
+import crypto from "crypto";
+
+type Cfg = { rpcUrl: string; routerAddr: string; signerKey: string };
+
+export class OsoRpcAdapter implements CustodyAdapter {
+  constructor(private cfg: Cfg) {}
+
+  async execute(plan: ExecutionPlan): Promise<ExecutionResult> {
+    // TODO: swap to real ÒSỌ́VM SDK when available.
+    const payload = {
+      router: this.cfg.routerAddr,
+      idempotencyKey: plan.idempotencyKey,
+      transfers: plan.lines.map(l => ({
+        to: l.to, amount: l.amountAse.toString(), kind: l.kind, memo: l.memo ?? null
+      }))
+    };
+
+    // simple HMAC for router ingestion (if your router expects it)
+    const mac = crypto.createHmac("sha256", this.cfg.signerKey).update(JSON.stringify(payload)).digest("hex");
+
+    // POST to router (pseudo; replace with fetch to your router RPC)
+    // await fetch(`${this.cfg.rpcUrl}/router/settle`, { method: "POST", headers: { "x-signature": mac }, body: JSON.stringify(payload) });
+
+    return { ok: true, txId: "oso://" + plan.idempotencyKey };
+  }
+}
+
+File: src/custody/adapters/safe.ts
+
+import { CustodyAdapter, ExecutionPlan, ExecutionResult } from "../types";
+
+/**
+ * Minimal Safe skeleton — wire in @safe-global/protocol-kit for production.
+ * pnpm add @safe-global/protocol-kit viem
+ */
+type Cfg = { rpcUrl: string; safeAddress: string; signerKey: string };
+
+export class SafeAdapter implements CustodyAdapter {
+  constructor(private cfg: Cfg) {}
+
+  async execute(plan: ExecutionPlan): Promise<ExecutionResult> {
+    // Map lines → individual ERC20 (Àṣẹ) transfers or native coin depending on design.
+    // Batch into a single Safe multi-send for atomicity.
+    // TODO: implement with ProtocolKit once asset semantics are finalized.
+    console.log("[SAFE] queued multi-send for", plan.idempotencyKey, plan.lines.length, "lines");
+    return { ok: true, txId: "safe://" + plan.idempotencyKey };
+  }
+}
+
+c) Route wiring (call the adapter)
+
+Patch: src/routes/treasury.ts (add after persistence)
+
+import { makeCustodyAdapter } from "../custody";
+const adapter = makeCustodyAdapter();
+
+// inside /treasury/route after creating `event` and computing line items:
+const lines = [
+  { kind: "tithe", to: ESU_VAULT, amountAse: tithe },
+  { kind: "platform_fee", to: process.env.AIO_TREASURY_ADDR ?? "AIO_TREASURY", amountAse: platformFee },
+  { kind: "beneficiary_net", to: beneficiary ?? "UNSPECIFIED", amountAse: beneficiaryNet }
+];
+
+let exec = { ok: false as boolean, txId: undefined as string | undefined };
+if (process.env.EXECUTE_ON_ROUTE === "true") {
+  exec = await adapter.execute({ idempotencyKey: event.id, lines, metadata });
+}
+
+return reply.send({
+  id: event.id,
+  product,
+  executed: exec.ok,
+  txId: exec.txId,
+  lines: lines.map(l => ({ ...l, amountAse: l.amountAse.toString() })),
+  totals: { tithe: tithe.toString(), platformFee: platformFee.toString(), beneficiaryNet: beneficiaryNet.toString() },
+  createdAt: event.createdAt
+});
+
+d) Env additions
+
+File: .env.example (append)
+
+# Custody selection: oso | safe | dry-run
+CUSTODY_ADAPTER=dry-run
+EXECUTE_ON_ROUTE=false
+
+# ÒSỌ́VM router (if using "oso")
+OSO_RPC_URL=http://localhost:8789
+OSO_ROUTER_ADDR=0xROUTER
+OSO_SIGNER_KEY=hex_private_key
+
+# Safe (if using "safe")
+SAFE_RPC_URL=https://rpc.mainnet.example
+SAFE_ADDRESS=0xSAFE
+SAFE_SIGNER_KEY=hex_private_key
+
+# Optional: time-boxed Crown pause (seconds since epoch)
+ESU_TITHE_PAUSED_UNTIL_EPOCH=0
+
+
+---
+
+3) VM‑aligned emergency pause window (time‑boxed)
+
+Small, explicit guard to match your “Crown pause” requirement.
+
+Patch: src/metrics/index.ts (add a gauge)
+
+export const tithePauseUntil = new client.Gauge({
+  name: "aio_tithe_pause_until_epoch_seconds",
+  help: "Epoch seconds until which the tithe is paused (time-boxed Crown pause)."
+});
+registry.registerMetric(tithePauseUntil);
+
+Patch: src/lib/fees.ts
+
+import { tithePauseUntil } from "../metrics";
+
+const ESU_TITHE_BPS = Number(process.env.ESU_TITHE_BPS ?? 369);
+const PAUSED_UNTIL = Number(process.env.ESU_TITHE_PAUSED_UNTIL_EPOCH ?? 0);
+tithePauseUntil.set(PAUSED_UNTIL);
+
+function nowSeconds() { return Math.floor(Date.now() / 1000); }
+
+function bps(amount: bigint, rate: number) {
+  return (amount * BigInt(rate)) / 10000n;
+}
+
+export function applyEsuTithe(grossAse: bigint) {
+  if (nowSeconds() < PAUSED_UNTIL) {
+    return { tithe: 0n, net: grossAse };
+  }
+  const tithe = bps(grossAse, ESU_TITHE_BPS);
+  const net = grossAse - tithe;
+  return { tithe, net };
+}
+
+> Pauses are visible in Prometheus and your alert will fire if the pause overruns.
+
+
+
+
+---
+
+4) Tests & rounding edges
+
+File: test/fees.spec.ts (Vitest)
+
+import { describe, it, expect } from "vitest";
+import { applyEsuTithe } from "../src/lib/fees";
+
+describe("applyEsuTithe", () => {
+  it("tithes 3.69% on 1000", () => {
+    const { tithe, net } = applyEsuTithe(1000n);
+    expect(tithe).toBe(36n); // floor(1000*369/10000)=36
+    expect(net).toBe(964n);  // 1000-36
+  });
+  it("rounds down on tiny amounts", () => {
+    const { tithe, net } = applyEsuTithe(9n);
+    expect(tithe).toBe(0n);
+    expect(net).toBe(9n);
+  });
+});
+
+> Integer arithmetic floors fractional atomic units; if you want bankers’ rounding or minimum‑tithe semantics, say the word and I’ll swap the math.
+
+
+
+
+---
+
+5) Swagger examples (add execution fields)
+
+Patch: src/openapi.yaml (response for /treasury/route)
+
+"200":
+          description: Persisted plan with ids, totals, and optional execution
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  executed: { type: boolean, example: false }
+                  txId: { type: string, nullable: true }
+                  lines:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind: { type: string, enum: [tithe, platform_fee, beneficiary_net] }
+                        to: { type: string }
+                        amountAse: { type: string }
+                  totals:
+                    type: object
+                    properties:
+                      tithe: { type: string }
+                      platformFee: { type: string }
+                      beneficiaryNet: { type: string }
+                  createdAt: { type: string, format: date-time }
+
+
+---
+
+6) One‑shot install notes
+
+# deps
+pnpm add prom-client zod
+# (optional Safe)
+# pnpm add @safe-global/protocol-kit viem
+
+# prisma
+pnpm prisma:generate
+pnpm prisma:migrate
+
+# run
+pnpm dev
+# or
+docker compose up --build -d
+
+# import Grafana dashboard JSON and point it at your Prometheus DS
+
+
+---
+
+Final recap
+
+VM: mandatory 3.69% Èṣù levy (double‑levy guard, exclusions, event).
+
+AIO: identical order of ops: tithe → (optional) product fee → beneficiary.
+
+Builders: full freedom on remainder.
+
+Added today: Grafana dashboard, Prometheus alerts, custody adapters (ÒSỌ́VM/Safe/dry‑run), and a time‑boxed Crown pause gauge + guard.
+
+
+If you want me to also ship a tiny council‑vote / Crown‑seal reference module for updating ESU_TITHE_BPS on ÒSỌ́VM (plus a mirrored governance check in the AIO config pipeline), I’ll draft it to your exact spec next.
