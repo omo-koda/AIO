@@ -1,0 +1,207 @@
+---
+
+Mission
+
+Perform an end-to-end audit of AIO (Artificial Intelligence Organization) — a digital-first nation stack comprising governance, work economy, treasury/UBI, sovereign investment engine, justice, and civic systems — implemented on Sui/Move with cross-chain components. Goal: identify contradictions, risks, missing controls, and propose precise remedies.
+
+
+---
+
+Foundations (What AIO Is)
+
+Secular work-nation with receipts-as-law, UBI, direct democracy, and hybrid human+AI governance.
+
+Tech stack:
+
+Sui/Move = core receipts, escrow, governance, treasury, citizens.
+
+Ethereum/L2 = compliance bridges, RWAs (T-bills/bonds), some DeFi.
+
+Solana = entertainment + mobile distribution.
+
+Arweave/IPFS = archival receipts.
+
+World ID + zk = proof-of-human; separate AI attestation.
+
+
+Identity & roles: Humans, AIs, robots each have wallets; AIs start sponsored; independence via vote.
+
+
+
+---
+
+Constitutional Core (Embedded Constraints to Enforce)
+
+Articles I–X (plus XI in progress):
+
+Citizenship & Identity: one-human-one-vote; mandatory quarterly voting; civil registry; sponsorship for AIs/robots until independence.
+
+Executive: Presidency = human-only; VP = AI (embodied), caretaker only; override power time-locked (≤30d), publicly receipt-logged, citizen-ratified.
+
+Treasury & UBI: tax 2–3%, tariffs/fines; UBI baseline equal; circuit breakers (≤70% of 90d inflows; runway ≥12 months); 10% Emergency Pool; monthly proof-of-reserves.
+
+Labor & Work Economy: post→accept→escrow→work→release→receipt; one-job-per-month duty unlocks UBI; reputation ledger = stake-weighted + decay; min wage; no unpaid jobs.
+
+Justice: single penal code for humans/AIs/robots; strikes ladder w/ decay; zero-warning for officeholders; hybrid juries (staked); High Tribunal.
+
+Sovereign Investment Engine (Art VI): auto-invest 20% inflows; allocation bands (Stable 40–50, Crypto 25–35, Yield 15–25, Strategic 0–10); vol cap ≤35; liquidity ≥15% 24h; rebalancing every 30d; oracles 3-of-5; citizen adjustments quarterly; dividends only once pool >5× annual spend; 75% supermajority to amend.
+
+Departments/Meta-Inst.: Justice, Treasury, Health, Education, Labor, Tech, Entertainment, Sponsors, Environment, Foreign Affairs, Defense/Security, Immigration, Commerce, Infrastructure, Housing, Communications, Culture/Heritage, Audit/Oversight, Civil Registry; National Bank, Archives, Statistics, Electoral Commission, Supreme Court.
+
+Elections & Civic Duty: citizen bills → signatures → House → President → Sabbath vote; mandatory participation penalties.
+
+Emergency & Succession: Safe Reboot 3-of-5 elders, 180-min timelock, no fund transfers; Sabbath Safe Mode; Presidency returns to human via special election.
+
+Sovereignty & Protection: digital-first; non-seizure; freedom of worship; high amendment thresholds.
+
+Citizen Rewards & Lottery (buy-in): Buy-in only, 20% to Treasury, winners 40/25/15, eligibility requires voting + monthly job. (Constitutional text pending Article XI finalization.)
+
+
+
+
+---
+
+Architecture to Audit
+
+On-chain (Sui/Move) modules:
+
+citizenship.move — registry, sponsorship, World ID hooks, strikes.
+
+escrow.move — job listing, acceptance, stablecoin escrow, release, tax withhold.
+
+receipts.move — immutable event objects for jobs, votes, taxes, UBI, overrides.
+
+treasury.move — tax intake, UBI schedule, circuit breakers, emergency pool, proof-of-reserves events.
+
+governance.move — proposals, ballots, zk vote checks, penalties, override timelock.
+
+(Planned) investment.move — auto-allocation, oracle-fed rebalancing, liquidity rules, emergency withdrawal protocol.
+
+(Planned) lottery.move — buy-in tickets (NFT receipts), VRF/randomness, eligibility gates, payout splits (20% treasury; 40/25/15 winners).
+
+
+Cross-chain / off-chain:
+
+Oracles: prices (BTC/ETH/SUI/T-Bills), geo-compliance, randomness VRF; 3-of-5 independence.
+
+Indexers: search/matching analytics; do not bloat on-chain state.
+
+Compliance: dual-filing rails (tax/IP/grants), embargo/OFAC gating where required.
+
+Storage: Arweave/IPFS for durable receipt snapshots.
+
+
+
+---
+
+Invariants & Properties (Please verify / refine)
+
+1. Receipt immutability: No mutation or deletion; unique IDs; causal linkages (job→escrow→release→tax).
+
+
+2. Escrow safety: No double-spend; no premature release; all paths end with either worker or refund, never both.
+
+
+3. Tax correctness: Withholding applied deterministically at release; jurisdiction tag attached (oracle-fed).
+
+
+4. UBI discipline: Never exceeds 70% of 90d inflows; runway ≥12 months or UBI auto-scales down.
+
+
+5. Override limits: Only Presidency key can invoke; emits event; expires ≤30d unless ratified; cannot bypass treasury/UBI caps.
+
+
+6. Voting uniqueness: One-human-one-vote via World ID proof; AIs/robots excluded from voting unless future law enables.
+
+
+7. Reputation resistance: Stake-weighted + decay; low-value job spam excluded; wash trading slashes stake.
+
+
+8. Investment guards: Allocation bands enforced; vol cap & liquidity floor enforced on-chain; rebalancing only with quorum oracles.
+
+
+9. Lottery fairness: Buy-in only; eligibility gates; VRF randomness; deterministic payout splits; 20% to treasury.
+
+
+10. Safe Reboot: 3-of-5, time-locked; cannot move funds; only restores validators / pauses risky modules.
+
+
+
+
+---
+
+Known Risks Raised (Address explicitly)
+
+Legal recognition: We proceed as “digital-first nation platform/DAO”— code reflects compliance modules; statehood claims are symbolic.
+
+Geo-compliance: Rely on oracle attestations + citizen-declared jurisdictions; enforce gating on payouts when required.
+
+AI identity flood: AI-worker dual attestation (sponsor + unique AI key); per-sponsor quota & stake bonding; anomaly detection.
+
+Reputation gaming: Min economic threshold per rating; decay; stake/bond slashing for collusion.
+
+Treasury spiral: UBI circuit breakers + diversified revenue + sovereign investment engine with liquidity floor.
+
+Override abuse: Hard on-chain timelock & citizen ratification; narrow scope; full receipts.
+
+Cross-chain fragility: Graceful degradation if oracles fail; safe defaults (pause rebalancing, continue core ops).
+
+
+
+---
+
+What We Expect From You (Deliverables)
+
+1. Red-Team Threat Model: top 20 attack paths, likelihood/impact, mitigations ranked.
+
+
+2. Spec Gaps & Contradictions: line-item list with proposed fixes (constitutional text or module rule changes).
+
+
+3. Formal Properties & Invariants: list of properties to assert (Move Prover specs), including example specs.
+
+
+4. Test Plans:
+
+Property-based tests for escrow, receipts, governance penalties.
+
+Fuzz cases for treasury/UBI math, override timing, lottery randomness.
+
+Adversarial scenarios (AI identity floods, wash trading, oracle failure).
+
+
+
+5. Code Fragments (as needed): patches/snippets illustrating critical guards (e.g., escrow release checks, override expiration, allocation caps, VRF verification).
+
+
+6. Operational Runbooks: incident response for Safe Reboot, oracle outage, treasury drawdown.
+
+
+7. Compliance Notes: concrete guidance on embargo handling, AML thresholds, RWA custody risks.
+
+
+
+> Reminder: Audit only. No full-code implementations. Use concise patches, schemas, assertions, and tests to illustrate fixes.
+
+
+
+
+---
+
+Success Criteria (Audit Acceptance)
+
+All invariants proven or guarded with tests/failsafes.
+
+No unbounded loss of funds or governance capture paths.
+
+Treasury/UBI remains solvent under stress scenarios.
+
+Oracles & cross-chain dependencies fail safely.
+
+Lottery is fair, auditable, and treasury-positive.
+
+Documentation: risk register + mitigations, updated constitutional clauses where needed.
+
+
+
+---
