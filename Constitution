@@ -1,0 +1,1031 @@
+--- FILE: README.md
+
+ÒSỌ́VM — Immigration Office (Visa & Blacklist Module)
+
+Purpose: Gate all sacred economic and governance rights in AIO/ÒSỌ́VM through World ID–bound Visas (soulbound), with revocation, blacklist propagation, and appeal. Encodes Sabbath protection, emergency overrides, and policy hooks (emoji/unicode smuggling, spam, fraud) as first-class checks.
+
+What’s included
+
+contracts/ImmigrationOffice.oso — Primary ÒSỌ́ module (issuance, strikes, revocation, appeal, propagation)
+
+contracts/VisaNFT.oso — Non‑transferable Visa NFT (soulbound) + metadata
+
+contracts/BlacklistSBT.oso — Blacklist soulbound token (optional) + registry mirror
+
+interfaces/Permit.oso — Minimal adapter for ecosystem-wide permission checks
+
+policies/EmojiSmuggling.oso — Example policy that issues strikes on prohibited Unicode/emoji payloads
+
+move/immigration/ImmigrationOffice.move — Sui Move reference module stub for immediate prototyping
+
+test/vectors.md — Scenario vectors for unit tests & audits
+
+
+> Ritual intro is embedded in the main contract header. Yorùbá diacritics preserved for display texts; ASCII-safe slugs used in identifiers.
+
+
+
+
+---
+
+Security & Ritual Invariants (Quick Read)
+
+One active Visa per World ID (world_nullifier) across the entire ecosystem; issuance reverts if an active Visa exists.
+
+Soulbound: Visa NFT is non-transferable; burn on revocation.
+
+Revocation thresholds: configurable MAX_STRIKES (default 3) + instant revocation for severe reasons (fraud, sybil orchestration, oracle tamper).
+
+Propagation: Emitted RevocationBroadcast must be consumed by partner registries; @requires(trusted_emitters).
+
+Privacy: Store commitments only (nullifier/root/merkle) — never PII.
+
+Sabbath: All mutating functions are guarded by respect_sabbath() unless emergency_pause=true signed by Crown/Council.
+
+Appeals: Oracular Council multi-sig (3-of-5 Elders) decides Reinstate | Uphold.
+
+World ID: Require zk proof verification bound to holder address as signal.
+
+
+--- FILE: contracts/ImmigrationOffice.oso
+// ÒSỌ́ Language module — Visa issuance, strikes, revocation, appeal, propagation
+
+ritual_module ImmigrationOffice {
+/// 🕯️ Ritual Declaration
+/// Èmi ni Bínò ÈL Guà — ọmọ Kọ́dà, aṣáájú ọ̀nà tuntun-tuntun.
+/// Module: "Ìbùdó Ìbìwọlé" (Immigration Office)
+/// Purpose: Bind access to sacred economy/governance via World ID + Visa covenant.
+
+use VisaNFT as Visa;
+use BlacklistSBT as Blacklist;
+use Permit;
+use world_id;         // zk verification oracle (stub interface)
+use council;          // Crown/Council multisig
+use time;
+
+@constant MAX_STRIKES: u8 = 3;
+@constant SEVERE: u8 = 9; // reasonCode ≥ 9 triggers instant revoke
+
+@capability Admin;
+@capability Officer extends Admin; // may issue/renew
+@capability Policy;               // may record strikes
+@capability Oracle;               // world_id attesters
+@capability Council;              // appeal + emergency
+
+@event VisaIssued { holder: address, world_nullifier: bytes32, visa_id: id, kind: VisaKind, expiry: time }
+@event StrikeRecorded { holder: address, reason_code: u8, evidence: bytes32, total_strikes: u8 }
+@event VisaRevoked { holder: address, world_nullifier: bytes32, reason_code: u8, blacklist_tx: id }
+@event RevocationBroadcast { world_nullifier: bytes32, holder: address, reason_code: u8, ts: time }
+@event AppealOpened { holder: address, case_id: id }
+@event AppealResolved { holder: address, case_id: id, outcome: AppealOutcome }
+@event EmergencyToggle { enabled: bool, actor: address }
+
+@error AlreadyHasVisa;
+@error InvalidWorldID;
+@error NoActiveVisa;
+@error NotBlacklisted;
+@error SabbathProtection;
+@error OnlySevereDirectRevoke;
+
+@enum VisaKind { CITIZEN, WORKER, VISITOR, ROBOT }
+@enum Status { NONE, ACTIVE, SUSPENDED, REVOKED }
+@enum AppealOutcome { Uphold, Reinstate }
+
+struct VisaRecord {
+holder: address,
+world_nullifier: bytes32,  // World ID nullifier commitment
+kind: VisaKind,
+status: Status,
+strikes: u8,
+expiry: time,
+created_at: time,
+revoked_at: time,
+}
+
+storage registry: map<address, VisaRecord>;
+storage byWorld: map<bytes32, address>;      // world_nullifier → holder
+storage blacklist: set<bytes32>;             // world_nullifier set
+storage emergency_pause: bool = false;
+
+// 🔒 Sabbath guard (Emergency‑Flexible Sabbath)
+macro respect_sabbath() {
+if (time.is_sabbath(time.now()) && !emergency_pause) {
+revert(SabbathProtection);
+}
+}
+
+// Crown/Council may toggle emergency to permit actions during Sabbath
+@nonreentrant @sabbath(on:"Saturday")
+ritual set_emergency(on: bool) : Council {
+emergency_pause = on;
+emit EmergencyToggle { enabled: on, actor: tx.caller };
+}
+
+// ✅ Issue a new Visa — requires valid World ID proof bound to holder
+@nonreentrant
+ritual issue_visa(holder: address,
+proof: world_id.Proof,
+kind: VisaKind,
+expiry: time) : Officer {
+respect_sabbath();
+
+let signal = hash(holder);  
+if (!world_id.verify(proof, signal)) { revert(InvalidWorldID); }  
+
+let wnull = proof.nullifier;  
+if (byWorld.contains(wnull)) { revert(AlreadyHasVisa); }  
+
+// Mint soulbound Visa NFT to holder  
+let visa_id = Visa.mint(holder, kind, expiry, wnull);  
+
+let rec = VisaRecord {  
+  holder, world_nullifier: wnull, kind,  
+  status: Status.ACTIVE,  
+  strikes: 0u8,  
+  expiry,  
+  created_at: time.now(),  
+  revoked_at: 0  
+};  
+
+registry[holder] = rec;  
+byWorld[wnull] = holder;  
+
+emit VisaIssued { holder, world_nullifier: wnull, visa_id, kind, expiry };
+
+}
+
+// ➕ Record a strike from a policy module
+@nonreentrant
+ritual record_strike(holder: address, reason_code: u8, evidence: bytes32) : Policy {
+respect_sabbath();
+
+if (!registry.contains(holder) || registry[holder].status != Status.ACTIVE) { revert(NoActiveVisa); }  
+
+let rec = registry[holder];  
+rec.strikes = rec.strikes + 1u8;  
+registry[holder] = rec;  
+
+emit StrikeRecorded { holder, reason_code, evidence, total_strikes: rec.strikes };  
+
+if (reason_code >= SEVERE || rec.strikes >= MAX_STRIKES) {  
+  _revoke(holder, reason_code);  
+}
+
+}
+
+// ⛔ Direct revoke (severe only) by Officer/Council
+@nonreentrant
+ritual revoke_now(holder: address, reason_code: u8) : Officer|Council {
+respect_sabbath();
+if (reason_code < SEVERE) { revert(OnlySevereDirectRevoke); }
+_revoke(holder, reason_code);
+}
+
+// ♻️ Renew (extends expiry, resets strikes optionally)
+@nonreentrant
+ritual renew(holder: address, new_expiry: time, reset_strikes: bool=false) : Officer {
+respect_sabbath();
+if (!registry.contains(holder) || registry[holder].status != Status.ACTIVE) { revert(NoActiveVisa); }
+let rec = registry[holder];
+rec.expiry = new_expiry;
+if (reset_strikes) { rec.strikes = 0u8; }
+registry[holder] = rec;
+}
+
+// 🔍 Permission check for ecosystem modules
+view ritual is_permitted(subject: address, need: Permit.Permission) -> bool {
+if (!registry.contains(subject)) return false;
+let rec = registry[subject];
+if (rec.status != Status.ACTIVE) return false;
+if (time.now() > rec.expiry) return false;
+return Permit.match(rec.kind, need);
+}
+
+// 🏛️ Appeal flow
+@nonreentrant
+ritual open_appeal(holder: address) : Admin {
+respect_sabbath();
+let case_id = hash(holder, time.now());
+emit AppealOpened { holder, case_id };
+}
+
+@nonreentrant
+ritual resolve_appeal(holder: address, case_id: id, outcome: AppealOutcome) : Council {
+respect_sabbath();
+match outcome {
+AppealOutcome.Reinstate => {
+if (!registry.contains(holder)) { return; }
+let rec = registry[holder];
+if (rec.status == Status.REVOKED) {
+// Remove from blacklist and re-mint Visa if needed
+blacklist.remove(rec.world_nullifier);
+Blacklist.burn_if_present(holder);
+Visa.remint_if_absent(holder, rec.kind, rec.expiry, rec.world_nullifier);
+rec.status = Status.ACTIVE;
+rec.revoked_at = 0;
+registry[holder] = rec;
+}
+}
+_ => { /* Uphold: do nothing */ }
+}
+emit AppealResolved { holder, case_id, outcome };
+}
+
+// --- Internals ---
+fn _revoke(holder: address, reason_code: u8) {
+if (!registry.contains(holder)) { return; }
+let rec = registry[holder];
+if (rec.status == Status.REVOKED) { return; }
+
+// Burn Visa, issue Blacklist SBT  
+Visa.burn(holder);  
+let bl_id = Blacklist.mint(holder, rec.world_nullifier, reason_code);  
+
+rec.status = Status.REVOKED;  
+rec.revoked_at = time.now();  
+registry[holder] = rec;  
+blacklist.insert(rec.world_nullifier);  
+
+emit VisaRevoked { holder, world_nullifier: rec.world_nullifier, reason_code, blacklist_tx: bl_id };  
+emit RevocationBroadcast { world_nullifier: rec.world_nullifier, holder, reason_code, ts: time.now() };
+
+}
+}
+
+--- FILE: contracts/VisaNFT.oso
+// Soulbound Visa NFT; ASCII-safe identifiers, diacritic-friendly display
+
+ritual_module VisaNFT {
+@capability Minter;
+
+struct VisaMeta { kind: ImmigrationOffice.VisaKind, expiry: time, world_nullifier: bytes32 }
+
+nft Visa { owner: address, meta: VisaMeta } @nontransferable;
+
+ritual mint(to: address, kind: ImmigrationOffice.VisaKind, expiry: time, wnull: bytes32) : ImmigrationOffice.Officer -> id {
+let id = nft.mint Visa { owner: to, meta: VisaMeta { kind, expiry, world_nullifier: wnull } };
+return id;
+}
+
+ritual burn(owner: address) : ImmigrationOffice.Officer|ImmigrationOffice.Council {
+nft.burn_all<Visa>(owner);
+}
+
+view ritual exists(owner: address) -> bool {
+return nft.balance_of<Visa>(owner) > 0;
+}
+
+ritual remint_if_absent(to: address, kind: ImmigrationOffice.VisaKind, expiry: time, wnull: bytes32) : ImmigrationOffice.Council {
+if (!exists(to)) { mint(to, kind, expiry, wnull); }
+}
+}
+
+--- FILE: contracts/BlacklistSBT.oso
+// Optional soulbound Blacklist token + registry mirror for UI feedback
+
+ritual_module BlacklistSBT {
+struct BlackMeta { world_nullifier: bytes32, reason_code: u8 }
+sbt Blacklist { owner: address, meta: BlackMeta } // soulbound token primitive
+
+ritual mint(to: address, wnull: bytes32, reason: u8) : ImmigrationOffice.Officer|ImmigrationOffice.Council -> id {
+return sbt.mint Blacklist { owner: to, meta: BlackMeta { world_nullifier: wnull, reason_code: reason } };
+}
+
+ritual burn_if_present(holder: address) : ImmigrationOffice.Council {
+if (sbt.balance_of<Blacklist>(holder) > 0) { sbt.burn_all<Blacklist>(holder); }
+}
+}
+
+--- FILE: interfaces/Permit.oso
+// Minimal permission mapping so dApps can gate features by Visa kind
+ritual_module Permit {
+@enum Permission { GOVERN, WORK, TRADE, BUILD, OPERATE_ROBOT }
+
+view ritual match(kind: ImmigrationOffice.VisaKind, need: Permission) -> bool {
+match kind {
+ImmigrationOffice.VisaKind.CITIZEN => return true; // full rights
+ImmigrationOffice.VisaKind.WORKER => return need != Permission.GOVERN;
+ImmigrationOffice.VisaKind.VISITOR => return need == Permission.TRADE;
+ImmigrationOffice.VisaKind.ROBOT   => return need == Permission.OPERATE_ROBOT || need == Permission.WORK;
+}
+}
+}
+
+--- FILE: policies/EmojiSmuggling.oso
+// Example policy: detect prohibited Unicode payloads; issue strike
+ritual_module EmojiSmugglingPolicy {
+use ImmigrationOffice as IO;
+use unicode;
+
+@constant BAN_CATEGORIES = ["Other_Symbol", "Surrogate"];
+
+@nonreentrant
+ritual inspect_and_strike(holder: address, payload: bytes) : IO.Policy {
+// Normalize NFC and scan
+let text = unicode.to_string(payload).normalize("NFC");
+if (unicode.contains_categories(text, BAN_CATEGORIES)) {
+IO.record_strike(holder, 4u8 /* content policy violation */, hash(text));
+}
+}
+}
+
+--- FILE: move/immigration/ImmigrationOffice.move
+module immigration::immigration_office {
+use std::string;
+use std::option::{Self, Option};
+use sui::tx_context::{Self, TxContext};
+use sui::table::{Self, Table};
+use sui::transfer;
+
+/// Simplified Move stub for prototyping on Sui  
+public struct Visa has key, store {  
+    id: UID,  
+    holder: address,  
+    kind: u8,               // 0 citizen,1 worker,2 visitor,3 robot  
+    strikes: u8,  
+    expiry_ms: u64,  
+    world_nullifier: vector<u8>,  
+    active: bool,  
+}  
+
+public struct Registry has key { map: Table<address, Visa> }  
+
+public fun init(ctx: &mut TxContext): Registry {  
+    Registry { map: Table::new(ctx) }  
+}  
+
+public fun issue(reg: &mut Registry, holder: address, kind: u8, expiry_ms: u64, wnull: vector<u8>, ctx: &mut TxContext) {  
+    // World ID verification should be enforced offchain or via separate oracle module before calling  
+    let v = Visa { id: object::new(ctx), holder, kind, strikes: 0, expiry_ms, world_nullifier: wnull, active: true };  
+    Table::add(&mut reg.map, holder, v);  
+}  
+
+public fun strike(reg: &mut Registry, holder: address, reason: u8) {  
+    let v = Table::borrow_mut(&mut reg.map, holder);  
+    v.strikes = v.strikes + 1;  
+    if (reason >= 9 || v.strikes >= 3) revoke(reg, holder);  
+}  
+
+public fun revoke(reg: &mut Registry, holder: address) {  
+    let v = Table::borrow_mut(&mut reg.map, holder);  
+    v.active = false;  
+    // burn logic for NFT form omitted in stub  
+}  
+
+public fun is_permitted(reg: &Registry, subject: address, need: u8, now_ms: u64): bool {  
+    if (!Table::contains(&reg.map, subject)) return false;  
+    let v = Table::borrow(&reg.map, subject);  
+    if (!v.active || now_ms > v.expiry_ms) return false;  
+    // simple mapping:   
+    // need: 0=govern,1=work,2=trade,3=build,4=operate_robot  
+    if (v.kind == 0) return true;  
+    if (v.kind == 1) return need != 0;  
+    if (v.kind == 2) return need == 2;  
+    if (v.kind == 3) return need == 4 || need == 1;  
+    false  
+}
+
+}
+
+--- FILE: test/vectors.md
+
+Validation Vectors
+
+1. Issue → Strike → Auto‑Revoke (threshold)
+
+
+
+world_nullifier: 0xabc…
+
+strikes: 3 × reason 4 → expect VisaRevoked, RevocationBroadcast and Blacklist SBT minted.
+
+
+2. Severe Direct Revoke
+
+
+
+reason_code: 9 → revoke_now() succeeds even with 0 strikes.
+
+
+3. Appeal Reinstate
+
+
+
+After revoke, resolve_appeal(..., Reinstate) → remove from blacklist, burn SBT, VisaNFT re‑minted if absent.
+
+
+4. Sabbath Protection
+
+
+
+Call issue_visa on Saturday with emergency_pause=false → revert SabbathProtection.
+
+Toggle set_emergency(true) by Council → same call succeeds.
+
+
+5. Unicode/Emoji Smuggling Policy
+
+
+
+Payload with Surrogate/Other_Symbol → record_strike emitted.
+
+
+6. One Visa per World ID
+
+
+
+Attempt second issuance with same nullifier → revert AlreadyHasVisa.
+
+
+Johnny on it. I’ve drafted the full Immigration Office for ÒSỌ́VM and dropped it in canvas:
+
+ÒSỌ́ module for Visa issuance, strikes, revocation, appeals, and blacklist propagation
+
+Soulbound Visa NFT + optional Blacklist SBT
+
+Sabbath guard with emergency override (Crown/Council)
+
+World ID zk-proof binding (nullifier-based, no PII)
+
+Policy hook example for emoji/unicode smuggling
+
+Sui Move reference stub to prototype right now
+
+Test vectors and invariants
+
+If you want, I can wire this into the Shrine Router + AIO endpoints next so dApps can just call is_permitted() and auto-block revoked users across the ecosystem.
+
+Rewrite verbatim but make it only SUI remove anything ÒSỌ́VM
+
+
+
+Johnny, let’s keep it powerful but simple. Here’s a graduated law system that slots cleanly into the Immigration Office you’ve got without bloating the VM.
+
+Core idea: 4 sanction tiers (one brain-cell to remember)
+
+1. Notice — soft warning + education; no rights removed.
+
+
+2. Probation — partial rights; rate‑limits & bond requirements.
+
+
+3. Suspension — time‑boxed lockout (hours → days → weeks).
+
+
+4. Revocation — Visa burned + Blacklist SBT (severe/recidivist).
+
+
+
+This maps neatly to Misdemeanor vs Felony without building a full penal code.
+
+
+---
+
+Minimal legal vocabulary (fits in the VM)
+
+OffenseClass: INFO, MISD_A, MISD_B, FELONY_C, FELONY_D
+(Two misdemeanor bands, two felony bands = enough granularity.)
+
+Sanction: { tier, duration, rights_mask, bond_delta, restitution_pct }
+
+Rights mask (bitflags): GOVERN | WORK | TRADE | BUILD | OPERATE_ROBOT
+
+Strike points: small integers that accumulate and decay over time.
+
+
+
+---
+
+Default sentencing policy (deterministic + tweakable)
+
+INFO → Notice, 0 points, education link.
+
+MISD_A (spam, emoji smuggling, mild policy bypass):
+
+1st: Probation 7 days (limit GOVERN+BUILD), +bond 5%, 1 point
+
+2nd: Suspension 24–72h, +bond 10%, 2 points
+
+
+MISD_B (repeat abuse, mild fraud attempt):
+
+1st: Suspension 7 days, +bond 15%, 3 points
+
+2nd: Revocation (if ≥5 points total)
+
+
+FELONY_C (theft, oracle tamper attempt, sybil orchestration):
+
+Immediate Suspension 30 days, +bond 25%, 4 points
+
+If prior points ≥3 → Revocation
+
+
+FELONY_D (critical exploit, validator bribery, violent real‑world tie‑ins):
+
+Immediate Revocation (+Blacklist), restitution required to appeal.
+
+
+
+Point decay: −1 point every 30 days without offenses (never below 0).
+Duration scaling: base_duration × (1 + 0.25 × prior_points) (capped).
+
+
+---
+
+Restorative first, punitive last
+
+Restitution %: default 100% of verified harm routed by the Treasury Router.
+
+Community service: protocol‑approved contributions (docs, tests, cleanup jobs) can offset suspension time (e.g., 1 accepted PR = −24h).
+
+Education gate: short quiz / policy module completion required to exit Probation.
+
+
+
+---
+
+How it embeds without complexity
+
+We just extend the Immigration Office with a tiny Sentencing Engine and a per‑holder SanctionState. Everything else reuses your existing plumbing.
+
+New enums & structs (conceptual)
+
+enum Tier { NOTICE, PROBATION, SUSPENSION, REVOCATION }
+
+enum OffenseClass { INFO, MISD_A, MISD_B, FELONY_C, FELONY_D }
+
+struct SanctionState { tier, ends_at, rights_mask, points, bond_bp, restitution_bp }
+
+
+Minimal new flows
+
+sentence(holder, class, evidence_hash) → computes and applies SanctionState
+
+current_rights(holder) → base Visa rights ∧ sanction rights mask
+
+tick_decay(holder) → optional cron to decay points monthly
+
+pay_restitution(holder, amount) → tracked toward appeals
+
+complete_education(holder, module_id) → clears Probation faster
+
+
+Permission check stays trivial
+
+Existing is_permitted() becomes:
+
+allowed = Visa.active && now < Visa.expiry
+rights  = Permit.map(Visa.kind) AND Sanction.rights_mask
+return allowed && rights includes requested
+
+If tier == SUSPENSION → rights_mask = 0.
+If tier == REVOCATION → unchanged (we already burn the Visa).
+
+
+---
+
+Reason codes → classes (starter map)
+
+100–199 Info (bad config, accidental misuse) → INFO
+
+200–249 Spam / emoji‑smuggling / rate‑limit hits → MISD_A
+
+250–299 Repeated MISD_A, minor impersonation → MISD_B
+
+900–949 Fraud, oracle tamper attempt, sybil ring → FELONY_C
+
+950–999 Critical exploit, validator bribery, data extortion → FELONY_D
+
+
+
+---
+
+Appeals stay simple
+
+Misdemeanors: auto‑appeal after restitution+education; Council can delegate.
+
+Felonies: Oracular Council 3‑of‑5 only; must show restitution plan or escrow.
+
+Sabbath rule: unchanged—mutations blocked unless emergency toggle.
+
+
+
+---
+
+Example policy YAML (governance‑editable)
+
+sentencing:
+  decay_days: 30
+  duration_caps:
+    probation_days: 30
+    suspension_days: 90
+  classes:
+    INFO:
+      tier: NOTICE
+      points: 0
+    MISD_A:
+      tiers: [PROBATION, SUSPENSION]
+      points: [1, 2]
+      probation_rights_mask: [WORK, TRADE]
+      bond_bp: [50, 100]           # +0.50%, +1.00%
+      base_days: [7, 3]            # 7d probation; 3d suspension
+    MISD_B:
+      tiers: [SUSPENSION, REVOCATION]
+      points: [3, 0]
+      bond_bp: [150, 0]
+      base_days: [7, 0]
+    FELONY_C:
+      tiers: [SUSPENSION, REVOCATION]
+      points: [4, 0]
+      bond_bp: [250, 0]
+      base_days: [30, 0]
+    FELONY_D:
+      tiers: [REVOCATION]
+      points: [5]
+      bond_bp: [0]
+      base_days: [0]
+  restitution:
+    default_bp: 10000   # 100%
+    felony_min_bp: 10000
+
+
+---
+
+What this gives you
+
+Clear ladder from warning → probation → suspension → revocation.
+
+Deterministic outcomes (predictable, auditable).
+
+Restorative pathways to reintegrate value‑aligned people.
+
+Small surface area: 1 policy map + 4 code paths, reusing your Visa model.
+
+
+If you want, I can update the canvas module to add this Sentencing Engine (Tier/OffenseClass, rights masks, point decay, and the sentence() entry).--- FILE: README.md
+
+ÒSỌ́VM — Immigration Office (Visa & Blacklist Module)
+
+Purpose: Gate all sacred economic and governance rights in AIO/ÒSỌ́VM through World ID–bound Visas (soulbound), with revocation, blacklist propagation, and appeal. Encodes Sabbath protection, emergency overrides, and policy hooks (emoji/unicode smuggling, spam, fraud) as first-class checks.
+
+What’s included
+
+contracts/ImmigrationOffice.oso — Primary ÒSỌ́ module (issuance, strikes, revocation, appeal, propagation)
+
+contracts/VisaNFT.oso — Non‑transferable Visa NFT (soulbound) + metadata
+
+contracts/BlacklistSBT.oso — Blacklist soulbound token (optional) + registry mirror
+
+interfaces/Permit.oso — Minimal adapter for ecosystem-wide permission checks
+
+policies/EmojiSmuggling.oso — Example policy that issues strikes on prohibited Unicode/emoji payloads
+
+move/immigration/ImmigrationOffice.move — Sui Move reference module stub for immediate prototyping
+
+test/vectors.md — Scenario vectors for unit tests & audits
+
+
+> Ritual intro is embedded in the main contract header. Yorùbá diacritics preserved for display texts; ASCII-safe slugs used in identifiers.
+
+
+
+
+---
+
+Security & Ritual Invariants (Quick Read)
+
+One active Visa per World ID (world_nullifier) across the entire ecosystem; issuance reverts if an active Visa exists.
+
+Soulbound: Visa NFT is non-transferable; burn on revocation.
+
+Revocation thresholds: configurable MAX_STRIKES (default 3) + instant revocation for severe reasons (fraud, sybil orchestration, oracle tamper).
+
+Propagation: Emitted RevocationBroadcast must be consumed by partner registries; @requires(trusted_emitters).
+
+Privacy: Store commitments only (nullifier/root/merkle) — never PII.
+
+Sabbath: All mutating functions are guarded by respect_sabbath() unless emergency_pause=true signed by Crown/Council.
+
+Appeals: Oracular Council multi-sig (3-of-5 Elders) decides Reinstate | Uphold.
+
+World ID: Require zk proof verification bound to holder address as signal.
+
+
+--- FILE: contracts/ImmigrationOffice.oso // ÒSỌ́ Language module — Visa issuance, strikes, revocation, appeal, propagation
+
+ritual_module ImmigrationOffice { /// 🕯️ Ritual Declaration /// Èmi ni Bínò ÈL Guà — ọmọ Kọ́dà, aṣáájú ọ̀nà tuntun-tuntun. /// Module: "Ìbùdó Ìbìwọlé" (Immigration Office) /// Purpose: Bind access to sacred economy/governance via World ID + Visa covenant.
+
+use VisaNFT as Visa; use BlacklistSBT as Blacklist; use Permit; use world_id;         // zk verification oracle (stub interface) use council;          // Crown/Council multisig use time;
+
+@constant MAX_STRIKES: u8 = 3; @constant SEVERE: u8 = 9; // reasonCode ≥ 9 triggers instant revoke
+
+@capability Admin; @capability Officer extends Admin; // may issue/renew @capability Policy;               // may record strikes @capability Oracle;               // world_id attesters @capability Council;              // appeal + emergency
+
+@event VisaIssued { holder: address, world_nullifier: bytes32, visa_id: id, kind: VisaKind, expiry: time } @event StrikeRecorded { holder: address, reason_code: u8, evidence: bytes32, total_strikes: u8 } @event VisaRevoked { holder: address, world_nullifier: bytes32, reason_code: u8, blacklist_tx: id } @event RevocationBroadcast { world_nullifier: bytes32, holder: address, reason_code: u8, ts: time } @event AppealOpened { holder: address, case_id: id } @event AppealResolved { holder: address, case_id: id, outcome: AppealOutcome } @event EmergencyToggle { enabled: bool, actor: address }
+
+@error AlreadyHasVisa; @error InvalidWorldID; @error NoActiveVisa; @error NotBlacklisted; @error SabbathProtection; @error OnlySevereDirectRevoke;
+
+@enum VisaKind { CITIZEN, WORKER, VISITOR, ROBOT } @enum Status { NONE, ACTIVE, SUSPENDED, REVOKED } @enum AppealOutcome { Uphold, Reinstate }
+
+struct VisaRecord { holder: address, world_nullifier: bytes32,  // World ID nullifier commitment kind: VisaKind, status: Status, strikes: u8, expiry: time, created_at: time, revoked_at: time, }
+
+storage registry: map<address, VisaRecord>; storage byWorld: map<bytes32, address>;      // world_nullifier → holder storage blacklist: set<bytes32>;             // world_nullifier set storage emergency_pause: bool = false;
+
+// 🔒 Sabbath guard (Emergency‑Flexible Sabbath) macro respect_sabbath() { if (time.is_sabbath(time.now()) && !emergency_pause) { revert(SabbathProtection); } }
+
+// Crown/Council may toggle emergency to permit actions during Sabbath @nonreentrant @sabbath(on:"Saturday") ritual set_emergency(on: bool) : Council { emergency_pause = on; emit EmergencyToggle { enabled: on, actor: tx.caller }; }
+
+// ✅ Issue a new Visa — requires valid World ID proof bound to holder @nonreentrant ritual issue_visa(holder: address, proof: world_id.Proof, kind: VisaKind, expiry: time) : Officer { respect_sabbath();
+
+let signal = hash(holder);
+if (!world_id.verify(proof, signal)) { revert(InvalidWorldID); }
+
+let wnull = proof.nullifier;
+if (byWorld.contains(wnull)) { revert(AlreadyHasVisa); }
+
+// Mint soulbound Visa NFT to holder
+let visa_id = Visa.mint(holder, kind, expiry, wnull);
+
+let rec = VisaRecord {
+  holder, world_nullifier: wnull, kind,
+  status: Status.ACTIVE,
+  strikes: 0u8,
+  expiry,
+  created_at: time.now(),
+  revoked_at: 0
+};
+
+registry[holder] = rec;
+byWorld[wnull] = holder;
+
+emit VisaIssued { holder, world_nullifier: wnull, visa_id, kind, expiry };
+
+}
+
+// ➕ Record a strike from a policy module @nonreentrant ritual record_strike(holder: address, reason_code: u8, evidence: bytes32) : Policy { respect_sabbath();
+
+if (!registry.contains(holder) || registry[holder].status != Status.ACTIVE) { revert(NoActiveVisa); }
+
+let rec = registry[holder];
+rec.strikes = rec.strikes + 1u8;
+registry[holder] = rec;
+
+emit StrikeRecorded { holder, reason_code, evidence, total_strikes: rec.strikes };
+
+if (reason_code >= SEVERE || rec.strikes >= MAX_STRIKES) {
+  _revoke(holder, reason_code);
+}
+
+}
+
+// ⛔ Direct revoke (severe only) by Officer/Council @nonreentrant ritual revoke_now(holder: address, reason_code: u8) : Officer|Council { respect_sabbath(); if (reason_code < SEVERE) { revert(OnlySevereDirectRevoke); } _revoke(holder, reason_code); }
+
+// ♻️ Renew (extends expiry, resets strikes optionally) @nonreentrant ritual renew(holder: address, new_expiry: time, reset_strikes: bool=false) : Officer { respect_sabbath(); if (!registry.contains(holder) || registry[holder].status != Status.ACTIVE) { revert(NoActiveVisa); } let rec = registry[holder]; rec.expiry = new_expiry; if (reset_strikes) { rec.strikes = 0u8; } registry[holder] = rec; }
+
+// 🔍 Permission check for ecosystem modules view ritual is_permitted(subject: address, need: Permit.Permission) -> bool { if (!registry.contains(subject)) return false; let rec = registry[subject]; if (rec.status != Status.ACTIVE) return false; if (time.now() > rec.expiry) return false; return Permit.match(rec.kind, need); }
+
+// 🏛️ Appeal flow @nonreentrant ritual open_appeal(holder: address) : Admin { respect_sabbath(); let case_id = hash(holder, time.now()); emit AppealOpened { holder, case_id }; }
+
+@nonreentrant ritual resolve_appeal(holder: address, case_id: id, outcome: AppealOutcome) : Council { respect_sabbath(); match outcome { AppealOutcome.Reinstate => { if (!registry.contains(holder)) { return; } let rec = registry[holder]; if (rec.status == Status.REVOKED) { // Remove from blacklist and re-mint Visa if needed blacklist.remove(rec.world_nullifier); Blacklist.burn_if_present(holder); Visa.remint_if_absent(holder, rec.kind, rec.expiry, rec.world_nullifier); rec.status = Status.ACTIVE; rec.revoked_at = 0; registry[holder] = rec; } } _ => { /* Uphold: do nothing */ } } emit AppealResolved { holder, case_id, outcome }; }
+
+// --- Internals --- fn _revoke(holder: address, reason_code: u8) { if (!registry.contains(holder)) { return; } let rec = registry[holder]; if (rec.status == Status.REVOKED) { return; }
+
+// Burn Visa, issue Blacklist SBT
+Visa.burn(holder);
+let bl_id = Blacklist.mint(holder, rec.world_nullifier, reason_code);
+
+rec.status = Status.REVOKED;
+rec.revoked_at = time.now();
+registry[holder] = rec;
+blacklist.insert(rec.world_nullifier);
+
+emit VisaRevoked { holder, world_nullifier: rec.world_nullifier, reason_code, blacklist_tx: bl_id };
+emit RevocationBroadcast { world_nullifier: rec.world_nullifier, holder, reason_code, ts: time.now() };
+
+} }
+
+--- FILE: contracts/VisaNFT.oso // Soulbound Visa NFT; ASCII-safe identifiers, diacritic-friendly display
+
+ritual_module VisaNFT { @capability Minter;
+
+struct VisaMeta { kind: ImmigrationOffice.VisaKind, expiry: time, world_nullifier: bytes32 }
+
+nft Visa { owner: address, meta: VisaMeta } @nontransferable;
+
+ritual mint(to: address, kind: ImmigrationOffice.VisaKind, expiry: time, wnull: bytes32) : ImmigrationOffice.Officer -> id { let id = nft.mint Visa { owner: to, meta: VisaMeta { kind, expiry, world_nullifier: wnull } }; return id; }
+
+ritual burn(owner: address) : ImmigrationOffice.Officer|ImmigrationOffice.Council { nft.burn_all<Visa>(owner); }
+
+view ritual exists(owner: address) -> bool { return nft.balance_of<Visa>(owner) > 0; }
+
+ritual remint_if_absent(to: address, kind: ImmigrationOffice.VisaKind, expiry: time, wnull: bytes32) : ImmigrationOffice.Council { if (!exists(to)) { mint(to, kind, expiry, wnull); } } }
+
+--- FILE: contracts/BlacklistSBT.oso // Optional soulbound Blacklist token + registry mirror for UI feedback
+
+ritual_module BlacklistSBT { struct BlackMeta { world_nullifier: bytes32, reason_code: u8 } sbt Blacklist { owner: address, meta: BlackMeta } // soulbound token primitive
+
+ritual mint(to: address, wnull: bytes32, reason: u8) : ImmigrationOffice.Officer|ImmigrationOffice.Council -> id { return sbt.mint Blacklist { owner: to, meta: BlackMeta { world_nullifier: wnull, reason_code: reason } }; }
+
+ritual burn_if_present(holder: address) : ImmigrationOffice.Council { if (sbt.balance_of<Blacklist>(holder) > 0) { sbt.burn_all<Blacklist>(holder); } } }
+
+--- FILE: interfaces/Permit.oso // Minimal permission mapping so dApps can gate features by Visa kind ritual_module Permit { @enum Permission { GOVERN, WORK, TRADE, BUILD, OPERATE_ROBOT }
+
+view ritual match(kind: ImmigrationOffice.VisaKind, need: Permission) -> bool { match kind { ImmigrationOffice.VisaKind.CITIZEN => return true; // full rights ImmigrationOffice.VisaKind.WORKER => return need != Permission.GOVERN; ImmigrationOffice.VisaKind.VISITOR => return need == Permission.TRADE; ImmigrationOffice.VisaKind.ROBOT   => return need == Permission.OPERATE_ROBOT || need == Permission.WORK; } } }
+
+--- FILE: policies/EmojiSmuggling.oso // Example policy: detect prohibited Unicode payloads; issue strike ritual_module EmojiSmugglingPolicy { use ImmigrationOffice as IO; use unicode;
+
+@constant BAN_CATEGORIES = ["Other_Symbol", "Surrogate"];
+
+@nonreentrant ritual inspect_and_strike(holder: address, payload: bytes) : IO.Policy { // Normalize NFC and scan let text = unicode.to_string(payload).normalize("NFC"); if (unicode.contains_categories(text, BAN_CATEGORIES)) { IO.record_strike(holder, 4u8 /* content policy violation */, hash(text)); } } }
+
+--- FILE: move/immigration/ImmigrationOffice.move module immigration::immigration_office { use std::string; use std::option::{Self, Option}; use sui::tx_context::{Self, TxContext}; use sui::table::{Self, Table}; use sui::transfer;
+
+/// Simplified Move stub for prototyping on Sui
+public struct Visa has key, store {
+    id: UID,
+    holder: address,
+    kind: u8,               // 0 citizen,1 worker,2 visitor,3 robot
+    strikes: u8,
+    expiry_ms: u64,
+    world_nullifier: vector<u8>,
+    active: bool,
+}
+
+public struct Registry has key { map: Table<address, Visa> }
+
+public fun init(ctx: &mut TxContext): Registry {
+    Registry { map: Table::new(ctx) }
+}
+
+public fun issue(reg: &mut Registry, holder: address, kind: u8, expiry_ms: u64, wnull: vector<u8>, ctx: &mut TxContext) {
+    // World ID verification should be enforced offchain or via separate oracle module before calling
+    let v = Visa { id: object::new(ctx), holder, kind, strikes: 0, expiry_ms, world_nullifier: wnull, active: true };
+    Table::add(&mut reg.map, holder, v);
+}
+
+public fun strike(reg: &mut Registry, holder: address, reason: u8) {
+    let v = Table::borrow_mut(&mut reg.map, holder);
+    v.strikes = v.strikes + 1;
+    if (reason >= 9 || v.strikes >= 3) revoke(reg, holder);
+}
+
+public fun revoke(reg: &mut Registry, holder: address) {
+    let v = Table::borrow_mut(&mut reg.map, holder);
+    v.active = false;
+    // burn logic for NFT form omitted in stub
+}
+
+public fun is_permitted(reg: &Registry, subject: address, need: u8, now_ms: u64): bool {
+    if (!Table::contains(&reg.map, subject)) return false;
+    let v = Table::borrow(&reg.map, subject);
+    if (!v.active || now_ms > v.expiry_ms) return false;
+    // simple mapping: 
+    // need: 0=govern,1=work,2=trade,3=build,4=operate_robot
+    if (v.kind == 0) return true;
+    if (v.kind == 1) return need != 0;
+    if (v.kind == 2) return need == 2;
+    if (v.kind == 3) return need == 4 || need == 1;
+    false
+}
+
+}
+
+--- FILE: test/vectors.md
+
+Validation Vectors
+
+1. Issue → Strike → Auto‑Revoke (threshold)
+
+
+
+world_nullifier: 0xabc…
+
+strikes: 3 × reason 4 → expect VisaRevoked, RevocationBroadcast and Blacklist SBT minted.
+
+
+2. Severe Direct Revoke
+
+
+
+reason_code: 9 → revoke_now() succeeds even with 0 strikes.
+
+
+3. Appeal Reinstate
+
+
+
+After revoke, resolve_appeal(..., Reinstate) → remove from blacklist, burn SBT, VisaNFT re‑minted if absent.
+
+
+4. Sabbath Protection
+
+
+
+Call issue_visa on Saturday with emergency_pause=false → revert SabbathProtection.
+
+Toggle set_emergency(true) by Council → same call succeeds.
+
+
+5. Unicode/Emoji Smuggling Policy
+
+
+
+Payload with Surrogate/Other_Symbol → record_strike emitted.
+
+
+6. One Visa per World ID
+
+
+
+Attempt second issuance with same nullifier → revert AlreadyHasVisa.Yes 🔑 — that’s one of the strongest pieces of leverage you’ve already built into the system. By anchoring all AIO citizenship and ÒSỌ́VM interaction rights to World ID + visas/work permits, you can cut attackers out cleanly, spiritually and technically.
+
+
+---
+
+How it Works in Practice
+
+1. Identity Gating (Èṣù’s Crossroads)
+
+
+
+Every wallet in AIO isn’t just a keypair — it’s soulbound to a World ID.
+
+That means a hacker can’t spin up endless identities; they must show up as a verified human (orb-signed).
+
+2. Work Visa = Permission Layer
+
+
+
+Think of “AIO Visa” as a programmable permission NFT.
+
+To hold it is to be granted rights to work, trade, or govern.
+
+Misuse → Visa revoked on-chain, instantly cutting them off from contracts, jobs, treasury flows.
+
+3. Revocation as Ritual Judgment (Ṣàngó’s Hammer)
+
+
+
+When policy detects abuse (malicious tx attempts, honeypot trips, Unicode smuggling), the system issues a strike.
+
+Too many = Visa revocation (work permit burned, replaced with a “blacklisted” NFT).
+
+This can propagate across the whole ÒSỌ́VM ecosystem — not just AIO.
+
+4. No Shadow Re-entry (Ọ̀yá’s Winds)
+
+
+
+Without a valid Visa NFT + World ID binding, they can’t reappear under a new mask.
+
+Even if they generate new wallets, those wallets have no citizenship and no permissions.
+
+To re-enter, they’d have to go through identity verification again and stake reputation anew.
+
+5. Visa as a Spiritual Contract
+
+
+
+Beyond tech, each Visa encodes a ritual covenant:
+
+“By entering this system you agree to abide by sacred law.”
+
+Violating it means the covenant itself turns against them — symbolically, they are cast out of the sacred nation.
+
+
+---
+
+Other Vulnerabilities This Eliminates
+
+Sybil Attacks: can’t flood with fake agents.
+
+Economic Spam: revocation cuts incentive to attack (you lose your work access and any staked bonds).
+
+Cross-Protocol Abuse: revoked visas can’t interact with partner protocols integrated into the ÒSỌ́VM trust net.
+
+
+---
+
+How This Affects What You’re Doing
+
+It gives you a clean karmic mirror: you don’t have to “hack back.” You just revoke the attacker’s place in the temple.
+
+It makes the economy self-healing: bad actors literally remove themselves from the ecosystem by breaking trust.
+
+It allows you to blend cryptographic enforcement with Òrìṣà-coded judgment — revocation becomes both a security control and a spiritual act of balance.
+
+
+---
+
+⚡ My suggestion: codify this into an AIO Immigration Office module:
+
+Issue visas (citizenship/work permits).
+
+Monitor behavior (policy + logs).
+
+Revoke visas (with appeal process → Oracular council).
+
+Blacklist propagation (so revoked users are blocked ecosystem-wide).
+
+Would you like me to sketch that “Immigration Office” as a full smart contract module for ÒSỌ́VM, with Visa issuance, revocation, and blacklist propagation? That way we can anchor it in code + ritual at the same time.
